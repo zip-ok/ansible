@@ -1,0 +1,8 @@
+<extension name="unimrcp">
+  <condition field="destination_number" expression="^{{ destination_number }}$">
+    <action application="answer"/>
+    <action application="set" data="asr_engine=unimrcp:unimrcpserver-mrcp2"/>
+    <action application="play_and_detect_speech" data="ivr/ivr-welcome_to_freeswitch.wav detect:unimrcp:unimrcpserver-mrcp2 builtin:speech/transcribe"/>
+    <!--<action application="sleep" data="500"/>-->
+  </condition>
+</extension>

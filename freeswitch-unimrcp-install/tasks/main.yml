@@ -1,0 +1,206 @@
+---
+# tasks file for unimrcp-whisper
+
+- name: Update repos cache
+  apt:
+    update_cache: yes
+
+- name: Install dep packages
+  apt:
+    pkg:
+    - git
+    - build-essential
+    - cmake
+    - automake
+    - autoconf
+    - libtool-bin
+    - libtool
+    - pkg-config
+    - libssl-dev
+    - zlib1g-dev
+    - libdb-dev
+    - unixodbc-dev
+    - libncurses5-dev
+    - libexpat1-dev
+    - libgdbm-dev
+    - bison
+    - erlang-dev
+    - libtpl-dev
+    - libtiff5-dev
+    - uuid-dev
+    - libpcre3-dev
+    - libedit-dev
+    - libsqlite3-dev
+    - libcurl4-openssl-dev
+    - nasm
+    - libogg-dev
+    - libspeex-dev
+    - libspeexdsp-dev
+    - libldns-dev
+    - python3-dev
+    - libavformat-dev
+    - libswscale-dev
+    - liblua5.2-dev
+    - libopus-dev
+    - libpq-dev
+    - libsndfile1-dev
+    - libflac-dev
+    - libogg-dev
+    - libvorbis-dev
+    - libevent-dev
+    - wget
+    - tar
+    - libjson-c-dev
+    - libapr1
+    - mc
+    - net-tools
+
+- name: Clean freeswitch, unimrcp dirs
+  file:
+    path: "{{ item }}"
+    state: absent
+  with_items:
+    - "{{ ansible_user_dir }}/freeswitch_unimrcp_proj"
+    - /usr/local/freeswitch
+    - /usr/local/unimrcp
+    - /usr/local/apr
+
+- name: Git clone freeswitch
+  git:
+    repo: 'https://github.com/signalwire/freeswitch.git'
+    dest: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/freeswitch"
+    version: v1.10.10
+
+- name: Git clone libks
+  git:
+    repo: 'https://github.com/signalwire/libks.git'
+    dest: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/libks"
+
+- name: Git clone sofia-sip
+  git:
+    repo: 'https://github.com/freeswitch/sofia-sip.git'
+    dest: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/sofia-sip"
+
+- name: Git clone spandsp
+  git:
+    repo: 'https://github.com/freeswitch/spandsp.git'
+    dest: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/spandsp"
+
+- name: Git clone signalwire-c
+  git:
+    repo: 'https://github.com/signalwire/signalwire-c.git'
+    dest: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/signalwire-c"
+
+- name: Check if dir exists
+  stat:
+    path: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/unimrcp-deps-1.6.0"
+  register: dir_stat
+
+- name: Get and unarchive unimrcp-deps-1.6.0
+  unarchive:
+    src: https://www.unimrcp.org/project/component-view/unimrcp-deps-1-6-0-tar-gz/download
+    dest: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj"
+    remote_src: yes
+  when: dir_stat.stat.exists == false
+
+- name: Git clone unimrcp
+  git:
+    repo: 'https://github.com/unispeech/unimrcp.git'
+    dest: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/unimrcp"
+
+- name: Git clone mod_unimrcp
+  git:
+    repo: 'https://github.com/freeswitch/mod_unimrcp.git'
+    dest: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/mod_unimrcp"
+
+- name: Copy build scripts
+  copy:
+    src: "{{ item.name }}"
+    dest: "{{ item.path }}"
+    mode: '0744'
+  with_items:
+    - { name: build_FreeSWITCH_deps.sh, path: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj" }
+    - { name: build_UniMRCP_deps.sh, path: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj" }
+    - { name: build_mod_unimrcp.sh, path: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj" }
+
+- name: Copy systemd services
+  copy:
+    src: "{{ item }}"
+    dest: /etc/systemd/system
+  with_items:
+    - freeswitch.service
+    - unimrcp.service
+
+- name: Create dir for unimrcp plugin
+  file:
+    path: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/mrcp_plugin"
+    state: directory
+
+- name: Copy unimrcp plugin templates
+  template:
+    src: "{{ item.name }}"
+    dest: "{{ item.path }}"
+  with_items:
+    - { name: Makefile.j2, path: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/mrcp_plugin/Makefile" }
+    - { name: src.c.j2, path: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/mrcp_plugin/src.c" }
+
+- name: Exec build_FreeSWITCH_deps.sh script and Save log
+  shell: "./build_FreeSWITCH_deps.sh > build_FreeSWITCH_deps.log"
+  args:
+    chdir: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj"
+    executable: /bin/bash
+
+- name: Exec build_UniMRCP_deps.sh script and Save log
+  shell: "./build_UniMRCP_deps.sh > build_UniMRCP_deps.log"
+  args:
+    chdir: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj"
+    executable: /bin/bash
+
+- name: Exec build_mod_unimrcp.sh script and Save log
+  shell: "./build_mod_unimrcp.sh > build_mod_unimrcp.log"
+  args:
+    chdir: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj"
+    executable: /bin/bash
+
+- name: Build unimrcp plugin
+  make:
+    chdir: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/mrcp_plugin"
+
+- name: Install unimrcp plugin
+  make:
+    chdir: "{{ ansible_user_dir }}/freeswitch_unimrcp_proj/mrcp_plugin"
+    target: install
+
+- name: Create dir for freeswitch conf
+  file:
+    path: /usr/local/freeswitch/conf/mrcp_profiles
+    state: directory
+
+- name: Copy freeswitch conf templates
+  template:
+    src: "{{ item.name }}"
+    dest: "{{ item.path }}"
+  with_items:
+    - { name: test.xml.j2, path: /usr/local/freeswitch/conf/mrcp_profiles/test.xml }
+    - { name: unimrcp.conf.xml.j2, path: /usr/local/freeswitch/conf/autoload_configs/unimrcp.conf.xml }
+    - { name: unimrcp.xml.j2, path: /usr/local/freeswitch/conf/dialplan/default/unimrcp.xml }
+    - { name: modules.conf.xml.j2, path: /usr/local/freeswitch/conf/autoload_configs/modules.conf.xml }
+
+- name: Copy unimrcp conf template
+  template:
+    src: unimrcpserver.xml.j2
+    dest: /usr/local/unimrcp/conf/unimrcpserver.xml
+
+- name: Restart, enable freeswitch service, daemon-reload
+  service:
+    state: restarted
+    enabled: true
+    daemon_reload: true
+    name: freeswitch
+
+- name: Restart, enable unimrcp service, daemon-reload
+  service:
+    state: restarted
+    enabled: true
+    daemon_reload: true
+    name: unimrcp

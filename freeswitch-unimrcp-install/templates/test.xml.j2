@@ -1,0 +1,41 @@
+<include>
+  <!-- UniMRCP Server MRCPv2 -->
+  <profile name="unimrcpserver-mrcp2" version="2">
+      <param name="client-ip" value="{{ client_ip }}"/>
+      <param name="client-port" value="{{ client_port }}"/>
+      <param name="server-ip" value="{{ server_ip }}"/>
+      <param name="server-port" value="{{ server_port }}"/>
+      <param name="speechrecog" value="asr"/>
+      <!--param name="force-destination" value="1"/-->
+      <param name="sip-transport" value="udp"/>
+      <!--param name="ua-name" value="FreeSWITCH"/-->
+      <!--param name="sdp-origin" value="FreeSWITCH"/-->
+      <!--param name="rtp-ext-ip" value="auto"/-->
+      <param name="rtp-ip" value="{{ rtp_ip }}"/>
+      <param name="rtp-port-min" value="{{ rtp_port_min }}"/>
+      <param name="rtp-port-max" value="{{ rtp_port_max }}"/>
+      <!-- enable/disable rtcp support -->
+      <param name="rtcp" value="0"/>
+      <!-- rtcp bye policies (rtcp must be enabled first)
+                        0 - disable rtcp bye
+                        1 - send rtcp bye at the end of session
+                        2 - send rtcp bye also at the end of each talkspurt (input)
+      -->
+      <param name="rtcp-bye" value="2"/>
+      <!-- rtcp transmission interval in msec (set 0 to disable) -->
+      <param name="rtcp-tx-interval" value="5000"/>
+      <!-- period (timeout) to check for new rtcp messages in msec (set 0 to disable) -->
+      <param name="rtcp-rx-resolution" value="1000"/>
+      <!--param name="playout-delay" value="50"/-->
+      <!--param name="max-playout-delay" value="200"/-->
+      <!--param name="ptime" value="20"/-->
+      <param name="codecs" value="PCMU PCMA L16/96/8000"/>
+      <!-- Add any default MRCP params for SPEAK requests here -->
+      <synthparams>
+      </synthparams>
+      <!-- Add any default MRCP params for RECOGNIZE requests here -->
+      <recogparams>
+          <!--param name="start-input-timers" value="false"/-->
+      </recogparams>
+  </profile>
+</include>

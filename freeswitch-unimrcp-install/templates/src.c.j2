@@ -1,0 +1,1122 @@
+/*
+ * Copyright 2008-2015 Arsen Chaloyan
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* 
+ * Mandatory rules concerning plugin implementation.
+ * 1. Each plugin MUST implement a plugin/engine creator function
+ *    with the exact signature and name (the main entry point)
+ *        MRCP_PLUGIN_DECLARE(mrcp_engine_t*) mrcp_plugin_create(apr_pool_t *pool)
+ * 2. Each plugin MUST declare its version number
+ *        MRCP_PLUGIN_VERSION_DECLARE
+ * 3. One and only one response MUST be sent back to the received request.
+ * 4. Methods (callbacks) of the MRCP engine channel MUST not block.
+ *   (asynchronous response can be sent from the context of other thread)
+ * 5. Methods (callbacks) of the MPF engine stream MUST not block.
+ */
+
+#include <curl/curl.h>
+#include <pthread.h>
+#include <json.h>
+
+#include <sys/time.h>
+
+#include <stdlib.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "mrcp_recog_engine.h"
+#include "mpf_activity_detector.h"
+#include "apt_consumer_task.h"
+#include "apt_log.h"
+
+#define RECOG_ENGINE_TASK_NAME "Demo Recog Engine"
+
+typedef struct demo_recog_engine_t demo_recog_engine_t;
+typedef struct demo_recog_channel_t demo_recog_channel_t;
+typedef struct demo_recog_msg_t demo_recog_msg_t;
+
+/** Declaration of recognizer engine methods */
+static apt_bool_t demo_recog_engine_destroy(mrcp_engine_t *engine);
+static apt_bool_t demo_recog_engine_open(mrcp_engine_t *engine);
+static apt_bool_t demo_recog_engine_close(mrcp_engine_t *engine);
+static mrcp_engine_channel_t* demo_recog_engine_channel_create(mrcp_engine_t *engine, apr_pool_t *pool);
+
+static const struct mrcp_engine_method_vtable_t engine_vtable = {
+	demo_recog_engine_destroy,
+	demo_recog_engine_open,
+	demo_recog_engine_close,
+	demo_recog_engine_channel_create
+};
+
+
+/** Declaration of recognizer channel methods */
+static apt_bool_t demo_recog_channel_destroy(mrcp_engine_channel_t *channel);
+static apt_bool_t demo_recog_channel_open(mrcp_engine_channel_t *channel);
+static apt_bool_t demo_recog_channel_close(mrcp_engine_channel_t *channel);
+static apt_bool_t demo_recog_channel_request_process(mrcp_engine_channel_t *channel, mrcp_message_t *request);
+
+static struct event_base	* gs_psoEvBase;
+static struct evhttp		* gs_psoEvHTTP;
+static int					  gs_iCURLInitialized;
+static unsigned int			  gs_uiSlncMaxDur;
+static unsigned int			  gs_uiSlncMaxLvl;
+static const char			* gs_pszURL;
+
+static const struct mrcp_engine_channel_method_vtable_t channel_vtable = {
+	demo_recog_channel_destroy,
+	demo_recog_channel_open,
+	demo_recog_channel_close,
+	demo_recog_channel_request_process
+};
+
+/** Declaration of recognizer audio stream methods */
+static apt_bool_t demo_recog_stream_destroy(mpf_audio_stream_t *stream);
+static apt_bool_t demo_recog_stream_open(mpf_audio_stream_t *stream, mpf_codec_t *codec);
+static apt_bool_t demo_recog_stream_close(mpf_audio_stream_t *stream);
+static apt_bool_t demo_recog_stream_write(mpf_audio_stream_t *stream, const mpf_frame_t *frame);
+
+static const mpf_audio_stream_vtable_t audio_stream_vtable = {
+	demo_recog_stream_destroy,
+	NULL,
+	NULL,
+	NULL,
+	demo_recog_stream_open,
+	demo_recog_stream_close,
+	demo_recog_stream_write,
+	NULL
+};
+
+static void * thread_http_req( void * p_pvArg );
+
+/** Declaration of demo recognizer engine */
+struct demo_recog_engine_t {
+	apt_consumer_task_t    *task;
+};
+
+struct s_sample {
+	char	* m_pcData;
+	size_t	  m_stDataSize;
+};
+
+struct s_list_elem {
+	void				* m_pvData;
+	struct s_list_elem	* m_psNext;
+};
+
+struct s_sample_list {
+	struct s_list_elem	* m_psFirst;
+	struct s_list_elem	* m_psLast;
+	size_t				  m_stDataSize;
+};
+
+struct s_thread_http_req_arg {
+	pthread_mutex_t			* m_pmutexResult;
+	struct s_list_elem		* m_psSmplList;
+	size_t					  m_stSmplSize;
+	char					**m_ppcResult;
+	size_t					*  m_pstResultSize;
+	demo_recog_channel_t *channel;
+};
+
+static int unimrcp_calc_avg( const char * p_pcData, size_t p_stDataSize );
+
+static void unimrcp_sample_list_add_elem( pthread_mutex_t * p_pMutex, struct s_sample_list * p_psSmplList, const char * p_pcData, size_t p_stDataSize );
+static struct s_list_elem * unimrcp_sample_list_give_away(
+	pthread_mutex_t * p_pMutex, struct s_sample_list * p_psSmplList, size_t * p_stTotalDataSize );
+static void unimrcp_sample_list_clear( struct s_list_elem * p_psSmplList );
+static struct s_list_elem * unimrcp_list_elem_erase( struct s_list_elem * p_psListElem );
+
+char* get_str_json(char *data, char *key) {
+  struct json_object* obj;
+  obj = json_tokener_parse(data);
+  struct json_object_iterator it;
+  struct json_object_iterator itEnd;
+  it = json_object_iter_begin(obj);
+  itEnd = json_object_iter_end(obj);
+  char* result;
+
+  while (!json_object_iter_equal(&it, &itEnd)) {
+      const char* key_name = json_object_iter_peek_name(&it);
+      if (strcmp(key_name, key) == 0) {
+        result = (char*) json_object_get_string(json_object_iter_peek_value(&it));
+        return result;
+      }
+  }
+  return NULL;
+}
+
+void launch_thread( 
+	pthread_mutex_t * p_pmutexResult, 
+	pthread_mutex_t * p_pmutexSmplLsit, 
+	struct s_sample_list * p_psSmplList,
+	char ** p_ppcResult, size_t * p_pstResultSize,
+	demo_recog_channel_t *channel
+) {
+	pthread_t treadHttpReq;
+	struct s_thread_http_req_arg * psArg;
+	
+	psArg = malloc( sizeof( struct s_thread_http_req_arg ) );
+	memset( psArg, 0, sizeof( struct s_thread_http_req_arg ) );
+	psArg->m_pmutexResult	= p_pmutexResult;
+	psArg->m_psSmplList		= unimrcp_sample_list_give_away( p_pmutexSmplLsit, p_psSmplList, & psArg->m_stSmplSize );
+	psArg->m_ppcResult		= p_ppcResult;
+	psArg->m_pstResultSize	= p_pstResultSize;
+	psArg->channel = channel;
+
+	pthread_create( & treadHttpReq, NULL, thread_http_req, psArg );
+	pthread_detach( treadHttpReq );
+}
+
+/** Declaration of demo recognizer channel */
+struct demo_recog_channel_t {
+	/** Back pointer to engine */
+	demo_recog_engine_t     *demo_engine;
+	/** Engine channel base */
+	mrcp_engine_channel_t   *channel;
+
+	/** Active (in-progress) recognition request */
+	mrcp_message_t          *recog_request;
+	/** Pending stop response */
+	mrcp_message_t          *stop_response;
+	/** Indicates whether input timers are started */
+	apt_bool_t               timers_started;
+	/** Voice activity detector */
+	mpf_activity_detector_t *detector;
+	/** File to write utterance to */
+	FILE                    *audio_out;
+
+	struct s_sample_list	  m_sSmplList;
+	pthread_mutex_t			  m_mutexSmplList;
+	pthread_mutex_t			  m_mutexResult;
+	int						  m_iSilenceCnt;
+	char *          last_result;
+	size_t             last_result_len;
+};
+
+typedef enum {
+	DEMO_RECOG_MSG_OPEN_CHANNEL,
+	DEMO_RECOG_MSG_CLOSE_CHANNEL,
+	DEMO_RECOG_MSG_REQUEST_PROCESS
+} demo_recog_msg_type_e;
+
+/** Declaration of demo recognizer task message */
+struct demo_recog_msg_t {
+	demo_recog_msg_type_e  type;
+	mrcp_engine_channel_t *channel; 
+	mrcp_message_t        *request;
+};
+
+static apt_bool_t demo_recog_msg_signal(demo_recog_msg_type_e type, mrcp_engine_channel_t *channel, mrcp_message_t *request);
+static apt_bool_t demo_recog_msg_process(apt_task_t *task, apt_task_msg_t *msg);
+
+/** Declare this macro to set plugin version */
+MRCP_PLUGIN_VERSION_DECLARE
+
+/**
+ * Declare this macro to use log routine of the server, plugin is loaded from.
+ * Enable/add the corresponding entry in logger.xml to set a cutsom log source priority.
+ *    <source name="RECOG-PLUGIN" priority="DEBUG" masking="NONE"/>
+ */
+MRCP_PLUGIN_LOG_SOURCE_IMPLEMENT(RECOG_PLUGIN,"RECOG-PLUGIN")
+
+/** Use custom log source mark */
+#define RECOG_LOG_MARK   APT_LOG_MARK_DECLARE(RECOG_PLUGIN)
+
+/** Create demo recognizer engine */
+MRCP_PLUGIN_DECLARE(mrcp_engine_t*) mrcp_plugin_create(apr_pool_t *pool)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	demo_recog_engine_t *demo_engine = apr_palloc(pool,sizeof(demo_recog_engine_t));
+	apt_task_t *task;
+	apt_task_vtable_t *vtable;
+	apt_task_msg_pool_t *msg_pool;
+
+	msg_pool = apt_task_msg_pool_create_dynamic(sizeof(demo_recog_msg_t),pool);
+	demo_engine->task = apt_consumer_task_create(demo_engine,msg_pool,pool);
+	if(!demo_engine->task) {
+		return NULL;
+	}
+	task = apt_consumer_task_base_get(demo_engine->task);
+	apt_task_name_set(task,RECOG_ENGINE_TASK_NAME);
+	vtable = apt_task_vtable_get(task);
+	if(vtable) {
+		vtable->process_msg = demo_recog_msg_process;
+	}
+
+	/* create engine base */
+	return mrcp_engine_create(
+				MRCP_RECOGNIZER_RESOURCE,  /* MRCP resource identifier */
+				demo_engine,               /* object to associate */
+				&engine_vtable,            /* virtual methods table of engine */
+				pool);                     /* pool to allocate memory from */
+}
+
+/** Destroy recognizer engine */
+static apt_bool_t demo_recog_engine_destroy(mrcp_engine_t *engine)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+
+	if( 0 != gs_iCURLInitialized ) {
+		curl_global_cleanup();
+		apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "'curl_global_cleanup' executed" );
+	}
+
+	demo_recog_engine_t *demo_engine = engine->obj;
+	if(demo_engine->task) {
+		apt_task_t *task = apt_consumer_task_base_get(demo_engine->task);
+		apt_task_destroy(task);
+		demo_engine->task = NULL;
+	}
+	return TRUE;
+}
+
+/** Open recognizer engine */
+static apt_bool_t demo_recog_engine_open(mrcp_engine_t *engine)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	demo_recog_engine_t *demo_engine = engine->obj;
+	if(demo_engine->task) {
+		apt_task_t *task = apt_consumer_task_base_get(demo_engine->task);
+		apt_task_start(task);
+	}
+
+	char const * str, * param;
+	char * end;
+
+	param = "silence_max_duration";
+	str = apr_table_getm( engine->pool, engine->config->params, param );
+	if( NULL != str ) {
+		gs_uiSlncMaxDur = strtol( str, & end, 10 );
+		if( str == end ) {
+			gs_uiSlncMaxDur = 0;
+		}
+	}
+	apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "'%s': '%u'", param, gs_uiSlncMaxDur );
+
+	param = "silence_max_level";
+	str = apr_table_getm( engine->pool, engine->config->params, param );
+	if( NULL != str ) {
+		gs_uiSlncMaxLvl = strtol( str, & end, 10 );
+		if( str == end ) {
+			gs_uiSlncMaxLvl = 0;
+		}
+	}
+	apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "'%s': '%u'", param, gs_uiSlncMaxLvl );
+
+	param = "whisper-URL";
+	str = apr_table_getm( engine->pool, engine->config->params, param );
+	if( NULL != str ) {
+		gs_pszURL = str;
+	} else {
+		gs_pszURL = "{{ whisper_URL }}";
+	}
+	apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "'%s': '%s'", param, gs_pszURL );
+
+	do {
+		if( CURLE_OK == curl_global_init( CURL_GLOBAL_DEFAULT ) ) {
+			apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "'curl_global_init' executed successfully" );
+			gs_iCURLInitialized = 1;
+		} else {
+			apt_log( RECOG_LOG_MARK, APT_PRIO_CRITICAL, "'curl_global_init' failed" );
+			break;
+		}
+	} while( FALSE );
+
+	return mrcp_engine_open_respond(engine,TRUE);
+}
+
+/** Close recognizer engine */
+static apt_bool_t demo_recog_engine_close(mrcp_engine_t *engine)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	demo_recog_engine_t *demo_engine = engine->obj;
+	if(demo_engine->task) {
+		apt_task_t *task = apt_consumer_task_base_get(demo_engine->task);
+		apt_task_terminate(task,TRUE);
+	}
+	return mrcp_engine_close_respond(engine);
+}
+
+static mrcp_engine_channel_t* demo_recog_engine_channel_create(mrcp_engine_t *engine, apr_pool_t *pool)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	mpf_stream_capabilities_t *capabilities;
+	mpf_termination_t *termination; 
+
+	/* create demo recog channel */
+	demo_recog_channel_t *recog_channel = apr_palloc(pool,sizeof(demo_recog_channel_t));
+	recog_channel->demo_engine = engine->obj;
+	recog_channel->recog_request = NULL;
+	recog_channel->stop_response = NULL;
+	recog_channel->detector = mpf_activity_detector_create(pool);
+	recog_channel->audio_out = NULL;
+	recog_channel->last_result = NULL;
+	recog_channel->last_result_len = 0;
+
+	memset( & recog_channel->m_sSmplList, 0, sizeof( recog_channel->m_sSmplList ) );
+	pthread_mutex_init( & recog_channel->m_mutexResult, NULL );
+	pthread_mutex_lock( & recog_channel->m_mutexResult );
+	pthread_mutex_init( & recog_channel->m_mutexSmplList, NULL );
+	recog_channel->m_iSilenceCnt = 0;
+
+	capabilities = mpf_sink_stream_capabilities_create(pool);
+	mpf_codec_capabilities_add(
+			&capabilities->codecs,
+			MPF_SAMPLE_RATE_8000 | MPF_SAMPLE_RATE_16000,
+			"LPCM");
+
+	/* create media termination */
+	termination = mrcp_engine_audio_termination_create(
+			recog_channel,        /* object to associate */
+			&audio_stream_vtable, /* virtual methods table of audio stream */
+			capabilities,         /* stream capabilities */
+			pool);                /* pool to allocate memory from */
+
+	/* create engine channel base */
+	recog_channel->channel = mrcp_engine_channel_create(
+			engine,               /* engine */
+			&channel_vtable,      /* virtual methods table of engine channel */
+			recog_channel,        /* object to associate */
+			termination,          /* associated media termination */
+			pool);                /* pool to allocate memory from */
+
+	return recog_channel->channel;
+}
+
+/** Destroy engine channel */
+static apt_bool_t demo_recog_channel_destroy(mrcp_engine_channel_t *channel)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	/* nothing to destrtoy */
+	return TRUE;
+}
+
+/** Open engine channel (asynchronous response MUST be sent)*/
+static apt_bool_t demo_recog_channel_open(mrcp_engine_channel_t *channel)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	if(channel->attribs) {
+		/* process attributes */
+		const apr_array_header_t *header = apr_table_elts(channel->attribs);
+		apr_table_entry_t *entry = (apr_table_entry_t *)header->elts;
+		int i;
+		for(i=0; i<header->nelts; i++) {
+			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Attrib name [%s] value [%s]",entry[i].key,entry[i].val);
+		}
+	}
+
+	return demo_recog_msg_signal(DEMO_RECOG_MSG_OPEN_CHANNEL,channel,NULL);
+}
+
+/** Close engine channel (asynchronous response MUST be sent)*/
+static apt_bool_t demo_recog_channel_close(mrcp_engine_channel_t *channel)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	return demo_recog_msg_signal(DEMO_RECOG_MSG_CLOSE_CHANNEL,channel,NULL);
+}
+
+/** Process MRCP channel request (asynchronous response MUST be sent)*/
+static apt_bool_t demo_recog_channel_request_process(mrcp_engine_channel_t *channel, mrcp_message_t *request)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	return demo_recog_msg_signal(DEMO_RECOG_MSG_REQUEST_PROCESS,channel,request);
+}
+
+/** Process RECOGNIZE request */
+static apt_bool_t demo_recog_channel_recognize(mrcp_engine_channel_t *channel, mrcp_message_t *request, mrcp_message_t *response)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	/* process RECOGNIZE request */
+	mrcp_recog_header_t *recog_header;
+	demo_recog_channel_t *recog_channel = channel->method_obj;
+	const mpf_codec_descriptor_t *descriptor = mrcp_engine_sink_stream_codec_get(channel);
+
+	if(!descriptor) {
+		apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to Get Codec Descriptor " APT_SIDRES_FMT, MRCP_MESSAGE_SIDRES(request));
+		response->start_line.status_code = MRCP_STATUS_CODE_METHOD_FAILED;
+		return FALSE;
+	}
+
+	recog_channel->timers_started = TRUE;
+
+	/* get recognizer header */
+	recog_header = mrcp_resource_header_get(request);
+	if(recog_header) {
+		apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "it got a record header: '%lu'", recog_header );
+		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_START_INPUT_TIMERS) == TRUE) {
+			recog_channel->timers_started = recog_header->start_input_timers;
+		}
+		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_NO_INPUT_TIMEOUT) == TRUE) {
+			mpf_activity_detector_noinput_timeout_set(recog_channel->detector,recog_header->no_input_timeout);
+		}
+		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_SPEECH_COMPLETE_TIMEOUT) == TRUE) {
+			mpf_activity_detector_silence_timeout_set(recog_channel->detector,recog_header->speech_complete_timeout);
+			apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "silence detector: '%u'", recog_header->speech_complete_timeout );
+		}
+	}
+
+	if(!recog_channel->audio_out) {
+		const apt_dir_layout_t *dir_layout = channel->engine->dir_layout;
+		char *file_name = apr_psprintf(channel->pool,"utter-%dkHz-%s.pcm",
+							descriptor->sampling_rate/1000,
+							request->channel_id.session_id.buf);
+		char *file_path = apt_vardir_filepath_get(dir_layout,file_name,channel->pool);
+		if(file_path) {
+			apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Open Utterance Output File [%s] for Writing",file_path);
+			recog_channel->audio_out = fopen(file_path,"wb");
+			if(!recog_channel->audio_out) {
+				apt_log(RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to Open Utterance Output File [%s] for Writing",file_path);
+			}
+		}
+	}
+
+	response->start_line.request_state = MRCP_REQUEST_STATE_INPROGRESS;
+	/* send asynchronous response */
+	mrcp_engine_channel_message_send(channel,response);
+	recog_channel->recog_request = request;
+	return TRUE;
+}
+
+/** Process STOP request */
+static apt_bool_t demo_recog_channel_stop(mrcp_engine_channel_t *channel, mrcp_message_t *request, mrcp_message_t *response)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	/* process STOP request */
+	demo_recog_channel_t *recog_channel = channel->method_obj;
+	/* store STOP request, make sure there is no more activity and only then send the response */
+	
+	recog_channel->stop_response = response;
+	return TRUE;
+}
+
+/** Process START-INPUT-TIMERS request */
+static apt_bool_t demo_recog_channel_timers_start(mrcp_engine_channel_t *channel, mrcp_message_t *request, mrcp_message_t *response)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	demo_recog_channel_t *recog_channel = channel->method_obj;
+	recog_channel->timers_started = TRUE;
+	return mrcp_engine_channel_message_send(channel,response);
+}
+
+/** Dispatch MRCP request */
+static apt_bool_t demo_recog_channel_request_dispatch(mrcp_engine_channel_t *channel, mrcp_message_t *request)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	apt_bool_t processed = FALSE;
+	mrcp_message_t *response = mrcp_response_create(request,request->pool);
+	switch(request->start_line.method_id) {
+		case RECOGNIZER_SET_PARAMS:
+			break;
+		case RECOGNIZER_GET_PARAMS:
+			break;
+		case RECOGNIZER_DEFINE_GRAMMAR:
+			break;
+		case RECOGNIZER_RECOGNIZE:
+			processed = demo_recog_channel_recognize(channel,request,response);
+			break;
+		case RECOGNIZER_GET_RESULT:
+			break;
+		case RECOGNIZER_START_INPUT_TIMERS:
+			processed = demo_recog_channel_timers_start(channel,request,response);
+			break;
+		case RECOGNIZER_STOP:
+			processed = demo_recog_channel_stop(channel,request,response);
+			break;
+		default:
+			break;
+	}
+	if(processed == FALSE) {
+		/* send asynchronous response for not handled request */
+		mrcp_engine_channel_message_send(channel,response);
+	}
+	return TRUE;
+}
+
+/** Callback is called from MPF engine context to destroy any additional data associated with audio stream */
+static apt_bool_t demo_recog_stream_destroy(mpf_audio_stream_t *stream)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+
+	if( NULL != stream && NULL != stream->obj ) {
+		demo_recog_channel_t * recog_channel = stream->obj;
+		pthread_mutex_destroy( & recog_channel->m_mutexResult );
+	}
+
+	return TRUE;
+}
+
+/** Callback is called from MPF engine context to perform any action before open */
+static apt_bool_t demo_recog_stream_open(mpf_audio_stream_t *stream, mpf_codec_t *codec)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	return TRUE;
+}
+
+/** Callback is called from MPF engine context to perform any action after close */
+static apt_bool_t demo_recog_stream_close(mpf_audio_stream_t *stream)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	return TRUE;
+}
+
+/* Raise demo START-OF-INPUT event */
+static apt_bool_t demo_recog_start_of_input(demo_recog_channel_t *recog_channel)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	/* create START-OF-INPUT event */
+	mrcp_message_t *message = mrcp_event_create(
+						recog_channel->recog_request,
+						RECOGNIZER_START_OF_INPUT,
+						recog_channel->recog_request->pool);
+	if(!message) {
+		return FALSE;
+	}
+
+	/* set request state */
+	message->start_line.request_state = MRCP_REQUEST_STATE_INPROGRESS;
+	/* send asynch event */
+	return mrcp_engine_channel_message_send(recog_channel->channel,message);
+}
+
+static char * gs_pcRespStrt = "<?xml version=\"1.0\"?><result><interpretation grammar=\"session:request1@form-level.store\" confidence=\"0.97\"><instance>one</instance><input mode=\"speech\">";
+static char * gs_pcRespEnd = "</input></interpretation></result>";
+static char * gs_text = "hello";
+
+static size_t gs_stRespStrtLen = 0;
+static size_t gs_stRespEndLen = 0;
+
+/* Load demo recognition result */
+static apt_bool_t demo_recog_result_load(demo_recog_channel_t *recog_channel, mrcp_message_t *message)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+
+  //use channel ->
+	//	char *          last_result;
+	//  size_t             last_result_len;
+	char * pcResult = "hello";
+	size_t stResSize = strlen(pcResult);
+	char * pcText;
+	size_t stTextLen = stResSize;
+
+	if( 0 != gs_stRespStrtLen ) {
+	} else {
+		gs_stRespStrtLen = strlen( gs_pcRespStrt );
+	}
+	if( 0 != gs_stRespEndLen ) {
+	} else {
+		gs_stRespEndLen = strlen( gs_pcRespEnd );
+	}
+
+	stTextLen += gs_stRespStrtLen;
+	stTextLen += gs_stRespEndLen;
+
+	pcText = malloc( stTextLen + 1 );
+	pcText[stTextLen] = 0;
+	
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "Recognition result length: '%u'", stTextLen );
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "PcText: '%u'", pcText );
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "PcResult: '%s'", pcResult );
+	if( NULL != pcText ) {
+		mrcp_generic_header_t * generic_header;
+
+		memcpy( pcText, gs_pcRespStrt, gs_stRespStrtLen );
+		if( NULL != pcResult && 0 != stResSize ) {
+			memcpy( pcText + gs_stRespStrtLen, pcResult, stResSize );
+		}
+		memcpy( pcText + gs_stRespStrtLen + stResSize, gs_pcRespEnd, gs_stRespEndLen );
+
+		// apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "Recognition result text: '%s'", pcText );
+
+
+		apt_string_assign_n( & message->body, pcText, stTextLen, message->pool );
+		apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "Assigned body." );
+
+		/* get/allocate generic header */
+		generic_header = mrcp_generic_header_prepare( message );
+		if( generic_header ) {
+			/* set content types */
+			apt_string_assign( & generic_header->content_type, "application/x-nlsml", message->pool );
+			mrcp_generic_header_property_add( message, GENERIC_HEADER_CONTENT_TYPE );
+			apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "created header." );
+		}
+		free( pcText );
+	}
+
+//	free( pcResult );
+
+	return TRUE;
+}
+
+/* Raise demo RECOGNITION-COMPLETE event */
+static apt_bool_t demo_recog_recognition_complete(demo_recog_channel_t *recog_channel, mrcp_recog_completion_cause_e cause)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	mrcp_recog_header_t *recog_header;
+	/* create RECOGNITION-COMPLETE event */
+	mrcp_message_t *message = mrcp_event_create(
+						recog_channel->recog_request,
+						RECOGNIZER_RECOGNITION_COMPLETE,
+						recog_channel->recog_request->pool);
+	if(!message) {
+		return FALSE;
+	}
+
+	/* get/allocate recognizer header */
+	recog_header = mrcp_resource_header_prepare(message);
+	if(recog_header) {
+		/* set completion cause */
+		recog_header->completion_cause = cause;
+		mrcp_resource_header_property_add(message,RECOGNIZER_HEADER_COMPLETION_CAUSE);
+	}
+	/* set request state */
+	message->start_line.request_state = MRCP_REQUEST_STATE_COMPLETE;
+
+	if(cause == RECOGNIZER_COMPLETION_CAUSE_SUCCESS) {
+		demo_recog_result_load(recog_channel,message);
+	}
+
+	recog_channel->recog_request = NULL;
+	/* send asynch event */
+	return mrcp_engine_channel_message_send(recog_channel->channel,message);
+}
+
+/** Callback is called from MPF engine context to write/send new frame */
+static apt_bool_t demo_recog_stream_write(mpf_audio_stream_t *stream, const mpf_frame_t *frame)
+{
+	// apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	demo_recog_channel_t *recog_channel = stream->obj;
+	if(recog_channel->stop_response) {
+		/* send asynchronous response to STOP request */
+		mrcp_engine_channel_message_send(recog_channel->channel,recog_channel->stop_response);
+		recog_channel->stop_response = NULL;
+		recog_channel->recog_request = NULL;
+		return TRUE;
+	}
+
+	if(recog_channel->recog_request) {
+		mpf_detector_event_e det_event = mpf_activity_detector_process(recog_channel->detector,frame);
+		switch(det_event) {
+			case MPF_DETECTOR_EVENT_ACTIVITY:
+				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Voice Activity " APT_SIDRES_FMT,
+					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
+				demo_recog_start_of_input(recog_channel);
+				break;
+			case MPF_DETECTOR_EVENT_INACTIVITY:
+				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Voice Inactivity " APT_SIDRES_FMT,
+					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
+				demo_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
+				break;
+			case MPF_DETECTOR_EVENT_NOINPUT:
+				apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Noinput " APT_SIDRES_FMT,
+					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
+				if(recog_channel->timers_started == TRUE) {
+					demo_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_NO_INPUT_TIMEOUT);
+				}
+				break;
+			default:
+				break;
+		}
+
+		if(recog_channel->recog_request) {
+			if((frame->type & MEDIA_FRAME_TYPE_EVENT) == MEDIA_FRAME_TYPE_EVENT) {
+				if(frame->marker == MPF_MARKER_START_OF_EVENT) {
+					apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Start of Event " APT_SIDRES_FMT " id:%d",
+						MRCP_MESSAGE_SIDRES(recog_channel->recog_request),
+						frame->event_frame.event_id);
+				}
+				else if(frame->marker == MPF_MARKER_END_OF_EVENT) {
+					apt_log(RECOG_LOG_MARK,APT_PRIO_INFO,"Detected End of Event " APT_SIDRES_FMT " id:%d duration:%d ts",
+						MRCP_MESSAGE_SIDRES(recog_channel->recog_request),
+						frame->event_frame.event_id,
+						frame->event_frame.duration);
+				}
+			}
+		}
+
+		if(recog_channel->audio_out) {
+			fwrite(frame->codec_frame.buffer,1,frame->codec_frame.size,recog_channel->audio_out);
+		}
+		if( 0 < gs_uiSlncMaxDur ) {
+			apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "%s: slnc: %d", __FUNCTION__, recog_channel->m_iSilenceCnt );
+			if( 0 == unimrcp_calc_avg( frame->codec_frame.buffer, frame->codec_frame.size ) ) {
+				recog_channel->m_iSilenceCnt = 0;
+			} else {
+				++ recog_channel->m_iSilenceCnt;
+				if( gs_uiSlncMaxDur == recog_channel->m_iSilenceCnt ) {
+					char * pcResult;
+					size_t stResSize;
+
+					apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "'%s': data flow treats like SILENCE", __FUNCTION__ );
+					launch_thread( & recog_channel->m_mutexResult, & recog_channel->m_mutexSmplList,
+									& recog_channel->m_sSmplList, & pcResult, & stResSize, recog_channel );
+					recog_channel->m_iSilenceCnt = 0;
+				}
+			}
+		} else {
+		}
+		unimrcp_sample_list_add_elem( & recog_channel->m_mutexSmplList, & recog_channel->m_sSmplList,
+										frame->codec_frame.buffer, frame->codec_frame.size );
+	}
+
+	return TRUE;
+}
+
+static apt_bool_t demo_recog_msg_signal(demo_recog_msg_type_e type, mrcp_engine_channel_t *channel, mrcp_message_t *request)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	apt_bool_t status = FALSE;
+	demo_recog_channel_t *demo_channel = channel->method_obj;
+	demo_recog_engine_t *demo_engine = demo_channel->demo_engine;
+	apt_task_t *task = apt_consumer_task_base_get(demo_engine->task);
+	apt_task_msg_t *msg = apt_task_msg_get(task);
+	if(msg) {
+		demo_recog_msg_t *demo_msg;
+		msg->type = TASK_MSG_USER;
+		demo_msg = (demo_recog_msg_t*) msg->data;
+
+		demo_msg->type = type;
+		demo_msg->channel = channel;
+		demo_msg->request = request;
+		status = apt_task_msg_signal(task,msg);
+	}
+	return status;
+}
+
+static apt_bool_t demo_recog_msg_process(apt_task_t *task, apt_task_msg_t *msg)
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+	demo_recog_msg_t *demo_msg = (demo_recog_msg_t*)msg->data;
+	switch(demo_msg->type) {
+		case DEMO_RECOG_MSG_OPEN_CHANNEL:
+			/* open channel and send asynch response */
+			mrcp_engine_channel_open_respond(demo_msg->channel,TRUE);
+			break;
+		case DEMO_RECOG_MSG_CLOSE_CHANNEL:
+		{
+			/* close channel, make sure there is no activity and send asynch response */
+			demo_recog_channel_t *recog_channel = demo_msg->channel->method_obj;
+			if(recog_channel->audio_out) {
+				fclose(recog_channel->audio_out);
+				recog_channel->audio_out = NULL;
+			}
+
+			mrcp_engine_channel_close_respond(demo_msg->channel);
+			break;
+		}
+		case DEMO_RECOG_MSG_REQUEST_PROCESS:
+			demo_recog_channel_request_dispatch(demo_msg->channel,demo_msg->request);
+			break;
+		default:
+			break;
+	}
+	return TRUE;
+}
+
+struct s_curl_read_data {
+	struct s_list_elem		* m_psCurrElem;
+	size_t					  m_stReadInd;
+};
+
+static size_t cb_curl_read_fn( char * buffer, size_t size, size_t nitems, void * userdata )
+{
+	struct s_curl_read_data * psoData = ( struct s_curl_read_data * ) userdata;
+	struct s_sample * psSample;
+	struct s_list_elem * psTmp;
+	size_t stBufSize = ( size * nitems );
+	size_t stWriteInd = 0;
+	size_t stCurDataSize;
+	size_t stBulkSize;
+
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s'", __FUNCTION__ );
+
+	while( NULL != psoData->m_psCurrElem && stBufSize > stWriteInd ) {
+		psSample = ( struct s_sample * ) psoData->m_psCurrElem->m_pvData;
+		stCurDataSize = psSample->m_stDataSize - psoData->m_stReadInd;
+		if( 0 != stCurDataSize ) {
+		} else {
+			psoData->m_psCurrElem = psoData->m_psCurrElem->m_psNext;
+			psoData->m_stReadInd = 0;
+			continue;
+		}
+		if( stBufSize - stWriteInd > stCurDataSize ) {
+			stBulkSize = stCurDataSize;
+		} else {
+			stBulkSize = stBufSize - stWriteInd;
+		}
+		memcpy( buffer + stWriteInd, psSample->m_pcData + psoData->m_stReadInd, stBulkSize );
+		stWriteInd += stBulkSize;
+		psoData->m_stReadInd += stBulkSize;
+	};
+
+	apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "leave '%s': buffer size: '%lu'; wtitten in buffer: '%lu'",
+											__FUNCTION__, stBufSize, stWriteInd );
+
+	return stWriteInd;
+}
+
+struct s_curl_write_data {
+	char	* m_pcData;
+	size_t	  m_stBufSize;
+	size_t	  m_stDataSize;
+};
+
+size_t cb_curl_write_fn( char * ptr, size_t size, size_t nmemb, void * userdata )
+{
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "enter into '%s': size: '%lu'; nitems: '%lu'", __FUNCTION__, size, nmemb );
+
+	struct s_curl_write_data * psoData = ( struct s_curl_write_data * ) userdata;
+	size_t stDataSize = size * nmemb;
+
+	apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "'%s': size: '%lu'; ptr: '%#x'; userdata: '%#x'", __FUNCTION__, stDataSize, ptr, userdata );
+
+	if( 0 != stDataSize && NULL != ptr) {
+	} else {
+		apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "'%s': no data on input... exit", __FUNCTION__ );
+		return 0;
+	}
+	if( NULL != psoData ) {
+	} else {
+		apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "'%s': no user data provided... exit", __FUNCTION__ );
+		return 0;
+	}
+	apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "'%s': data size expected: '%lu'; buffer size: '%lu'", __FUNCTION__, psoData->m_stDataSize + stDataSize, psoData->m_stBufSize );
+	if( psoData->m_stDataSize + stDataSize < psoData->m_stBufSize ) {
+	} else {
+		size_t stNewSize = psoData->m_stBufSize + stDataSize * 2;
+		char * pcData = realloc( psoData->m_pcData, stNewSize );
+		if( NULL != pcData ) {
+			psoData->m_pcData = pcData;
+			psoData->m_stBufSize = stNewSize;
+		} else {
+			apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "'%s': realloc failed: requested block size: '%lu'", __FUNCTION__, stNewSize );
+			return 0;
+		}
+	}
+	memcpy( psoData->m_pcData + psoData->m_stDataSize, ptr, stDataSize );
+	psoData->m_stDataSize += stDataSize;
+
+	return stDataSize;
+}
+
+#define CALL_FN( res, op, call, success, failed ) \
+	if( res op call ) { success; } else { apt_log( RECOG_LOG_MARK, APT_PRIO_ERROR, "'%s' failed", #call ); { failed; } }
+
+static int unimrcp_recog_plugin_send_http_req_curl( struct s_list_elem * p_psSmplList, size_t p_stTotalDataSize, char ** p_ppcResult, size_t * p_pstResSize )
+{
+	int iRetVal = 0;
+	CURL * psoCURL = NULL;
+	struct s_curl_read_data soReadData = { p_psSmplList, 0 };
+	struct s_curl_write_data soWriteData = { NULL, 0, 0 };
+	struct curl_slist * listHTTPHdrs = NULL;
+	curl_mime * multipart = NULL;
+	char * pszContentLength = NULL;
+	long lRespCode = 0;
+
+	FILE * psoFile = fopen( "/opt/unimrcp/var/curl.log", "a" );
+
+	apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "%s: total data in list: '%lu'", __FUNCTION__, p_stTotalDataSize );
+
+	* p_ppcResult = NULL;
+	* p_pstResSize = 0;
+
+	do {
+		CURLcode curlRes;
+		char mcCURLErr[ CURL_ERROR_SIZE ];
+
+		CALL_FN( NULL, !=, ( psoCURL = curl_easy_init() ), NULL, iRetVal = ENOMEM; break );
+
+		/* DEBUG options */
+		CALL_FN( CURLE_OK, ==, ( curlRes = curl_easy_setopt( psoCURL, CURLOPT_STDERR, psoFile ) ), NULL, break );
+		CALL_FN( CURLE_OK, ==, ( curlRes = curl_easy_setopt( psoCURL, CURLOPT_VERBOSE, 1L ) ), NULL, break );
+
+		CALL_FN( CURLE_OK, ==, ( curlRes = curl_easy_setopt( psoCURL, CURLOPT_ERRORBUFFER, mcCURLErr ) ), NULL, break );
+		CALL_FN( CURLE_OK, ==, ( curlRes = curl_easy_setopt( psoCURL, CURLOPT_URL, gs_pszURL ) ), NULL, break );
+		CALL_FN( CURLE_OK, ==, ( curlRes = curl_easy_setopt( psoCURL, CURLOPT_POST, 1L ) ), NULL, break );
+
+		CALL_FN( NULL, !=, ( listHTTPHdrs = curl_slist_append( listHTTPHdrs, "Accept: application/json" ) ), NULL, iRetVal = ENOMEM; break );
+		CALL_FN( NULL, !=, ( listHTTPHdrs = curl_slist_append( listHTTPHdrs, "Content-Type: multipart/form-data" ) ), NULL, iRetVal = ENOMEM; break );
+		CALL_FN( CURLE_OK, ==, ( curlRes = curl_easy_setopt( psoCURL, CURLOPT_HTTPHEADER, listHTTPHdrs ) ), NULL, break );
+
+		{
+			curl_mimepart * part;
+
+			CALL_FN( NULL, !=, ( multipart = curl_mime_init( psoCURL ) ), NULL, iRetVal = ENOMEM; break );
+			CALL_FN( NULL, !=, ( part = curl_mime_addpart( multipart ) ), NULL, iRetVal = ENOMEM; break );
+			CALL_FN( CURLE_OK, ==, ( curlRes = curl_mime_name( part, "file" ) ), NULL, break );
+			{
+				struct timeval tv;
+				char mcFileName[ 64 ];
+				CALL_FN( 0, ==, gettimeofday( & tv, NULL ), NULL, iRetVal = -1; break );
+				CALL_FN( 0, <, snprintf( mcFileName, sizeof( mcFileName ) - 1, "%lx_%lx_%i.pcm", tv.tv_sec, tv.tv_usec, rand() ), NULL, iRetVal = -1; break );
+				CALL_FN( CURLE_OK, ==, ( curlRes = curl_mime_filename( part, mcFileName ) ), NULL, break );
+			}
+			CALL_FN( CURLE_OK, ==, ( curlRes = curl_mime_data_cb( part, p_stTotalDataSize, cb_curl_read_fn, NULL, NULL, & soReadData ) ), NULL, break );
+			CALL_FN( CURLE_OK, ==, ( curlRes = curl_easy_setopt( psoCURL, CURLOPT_MIMEPOST, multipart) ), NULL, break );
+		}
+
+		CALL_FN( CURLE_OK, ==, ( curlRes = curl_easy_setopt( psoCURL, CURLOPT_WRITEFUNCTION, cb_curl_write_fn ) ), NULL, break );
+		CALL_FN( CURLE_OK, ==, ( curlRes = curl_easy_setopt( psoCURL, CURLOPT_WRITEDATA, & soWriteData ) ), NULL, break );
+
+		CALL_FN( CURLE_OK, ==, ( curlRes = curl_easy_perform( psoCURL ) ), NULL, iRetVal = -1; break );
+
+		CALL_FN( CURLE_OK, ==, ( curlRes = curl_easy_getinfo( psoCURL, CURLINFO_RESPONSE_CODE, & lRespCode ) ), NULL, iRetVal = -1; break );
+		if( 200 == lRespCode ) {
+			apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "http respose code: %u", lRespCode );
+			if( NULL != soWriteData.m_pcData && 0 != soWriteData.m_stDataSize ) {
+				* p_ppcResult = soWriteData.m_pcData;
+				* p_pstResSize = soWriteData.m_stDataSize;
+			}
+		}
+	} while( FALSE );
+
+	if( NULL != multipart ) {
+		curl_mime_free( multipart );
+	}
+
+	if( NULL != pszContentLength ) {
+		free( pszContentLength );
+	}
+
+	if( NULL != listHTTPHdrs ) {
+		curl_slist_free_all( listHTTPHdrs );
+	}
+	if( NULL != psoCURL ) {
+		curl_easy_cleanup( psoCURL );
+	}
+
+	if( NULL != psoFile ) {
+		fclose( psoFile );
+	}
+
+	return iRetVal;
+}
+
+//handle result from curl WHISPER 
+static void * thread_http_req( void * p_pvArg )
+{
+	struct s_thread_http_req_arg * psoArg = ( struct s_thread_http_req_arg * ) p_pvArg;
+	char * pcResult;
+	size_t stResSize;
+
+	apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "%s: total data in list: '%lu'", __FUNCTION__, psoArg->m_stSmplSize );
+
+	if( NULL != psoArg->m_psSmplList ) {
+		unimrcp_recog_plugin_send_http_req_curl( psoArg->m_psSmplList, psoArg->m_stSmplSize, & pcResult, & stResSize );
+		if( NULL != pcResult && 0 != stResSize ) {
+			* psoArg->m_ppcResult		= pcResult;
+			* psoArg->m_pstResultSize	= stResSize;
+			char* recognition_text = get_str_json(pcResult, "text");
+			psoArg->channel->last_result = recognition_text;
+			psoArg->channel->last_result_len = recognition_text == NULL ? 0 : strlen(recognition_text);
+			apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "%s: recognition result: %s", __FUNCTION__, pcResult );
+			demo_recog_recognition_complete(psoArg->channel,RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
+		} else {
+			* psoArg->m_ppcResult		= NULL;
+			* psoArg->m_pstResultSize	= 0;
+			apt_log( RECOG_LOG_MARK, APT_PRIO_INFO, "%s: recognition result: %s", __FUNCTION__, "<NONE>" );
+		}
+	}
+//	pthread_mutex_unlock( psoArg->m_pmutexResult );
+	unimrcp_sample_list_clear( psoArg->m_psSmplList );
+
+	pthread_exit( NULL );
+}
+
+static int unimrcp_calc_avg( const char * p_pcData, size_t p_stDataSize )
+{
+	if( 0 < gs_uiSlncMaxLvl ) {
+		size_t i;
+		size_t s = 0;
+		uint16_t * pshData = ( uint16_t * ) p_pcData;
+
+		for( i = 0; i < p_stDataSize / ( sizeof( * pshData ) / sizeof( * p_pcData ) ); ++i ) {
+			s += pshData[ i ];
+		}
+		if( 0 != i ) {
+			s /= i;
+		}
+		apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "%s: smpls: %u; avg: %lu", __FUNCTION__, i, s );
+
+		return ( ( ( ( unsigned int ) s ) <= gs_uiSlncMaxLvl ) ? 1 : 0 );
+	} else {
+		return 0;
+	}		
+}
+
+static void unimrcp_sample_list_add_elem( pthread_mutex_t * p_pMutex, struct s_sample_list * p_psSmplList,
+										const char * p_pcData, size_t p_stDataSize )
+{
+	if( 0 == pthread_mutex_lock( p_pMutex ) ) {
+		struct s_list_elem * psElem = malloc( sizeof( struct s_list_elem ) );
+		struct s_sample * psSample = malloc( sizeof( struct s_sample ) );
+
+		psSample->m_pcData = malloc( p_stDataSize );
+		memcpy( psSample->m_pcData, p_pcData, p_stDataSize );
+		psSample->m_stDataSize = p_stDataSize;
+
+		psElem->m_pvData = psSample;
+		psElem->m_psNext = NULL;
+
+		if( NULL != p_psSmplList->m_psFirst ) {
+			p_psSmplList->m_psLast->m_psNext = psElem;
+			p_psSmplList->m_psLast = psElem;
+		} else {
+			p_psSmplList->m_psFirst = psElem;
+			p_psSmplList->m_psLast = psElem;
+		}
+		p_psSmplList->m_stDataSize += p_stDataSize;
+
+		pthread_mutex_unlock( p_pMutex );
+	} else {
+		apt_log( RECOG_LOG_MARK, APT_PRIO_ERROR, "%s: 'pthread_mutex_lock' failed", __FUNCTION__ );
+	}
+}
+
+static struct s_list_elem * unimrcp_sample_list_give_away(
+	pthread_mutex_t * p_pMutex, struct s_sample_list * p_psSmplList, size_t * p_stTotalDataSize )
+{
+	if( 0 == pthread_mutex_lock( p_pMutex ) ) {
+		apt_log( RECOG_LOG_MARK, APT_PRIO_DEBUG, "%s: total data in list: '%lu'", __FUNCTION__, p_psSmplList->m_stDataSize );
+		struct s_list_elem * psRetVal = p_psSmplList->m_psFirst;
+		if( NULL != p_stTotalDataSize ) {
+			( * p_stTotalDataSize ) = p_psSmplList->m_stDataSize;
+		}
+		p_psSmplList->m_psFirst = NULL;
+		p_psSmplList->m_psLast = NULL;
+		p_psSmplList->m_stDataSize = 0;
+		pthread_mutex_unlock( p_pMutex );
+		return psRetVal;
+	} else {
+		apt_log( RECOG_LOG_MARK, APT_PRIO_ERROR, "%s: 'pthread_mutex_lock' failed", __FUNCTION__ );
+		return NULL;
+	}
+}
+
+static void unimrcp_sample_list_clear( struct s_list_elem * p_psSmplList )
+{
+	while( NULL != ( p_psSmplList = unimrcp_list_elem_erase( p_psSmplList ) ) ) {
+	}
+}
+
+static struct s_list_elem * unimrcp_list_elem_erase( struct s_list_elem * p_psListElem )
+{
+	struct s_list_elem * psRetVal = p_psListElem->m_psNext;
+	free( p_psListElem->m_pvData );
+	free( p_psListElem );
+	return psRetVal;
+}

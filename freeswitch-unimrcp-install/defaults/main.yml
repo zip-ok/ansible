@@ -1,0 +1,20 @@
+---
+# defaults file for unimrcp-whisper
+
+# for unimrcp.xml
+destination_number: 1234
+
+# for test.xml & unimrcpserver.xml
+client_ip: 172.20.20.45
+client_port: 16090
+
+server_ip: 172.20.20.45
+server_port: 8060
+
+rtp_ip: 172.20.20.45
+rtp_port_min: 5000
+rtp_port_max: 6000
+
+unimrcpserver_ip: 172.20.20.45
+rtp_ext_ip: 172.20.20.45
+whisper_URL: "http://172.20.20.43:8000/uploadfile"

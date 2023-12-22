@@ -1,0 +1,7 @@
+recg_plugin:
+	gcc -shared -fPIC -g src.c -o recg_plugin.so -I/usr/local/unimrcp/include \
+        -I/usr/local/apr/include/apr-1 -I/usr/include/x86_64-linux-gnu/curl -levent -lcurl \
+        -I/usr/include/json-c/ -ljson-c
+
+install:
+	cp recg_plugin.so /usr/local/unimrcp/plugin/recg_plugin.so
